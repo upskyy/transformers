@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.utils.checkpoint
 from torch import nn
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 
 from ...activations import ACT2FN
@@ -1600,10 +1601,12 @@ class WhisperModel(WhisperPreTrainedModel):
          >>> ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
          >>> inputs = feature_extractor(ds[0]["audio"]["array"], return_tensors="pt")
          >>> input_features = inputs.input_features
-         >>> decoder_input_ids = torch.tensor([[1, 1]]) * model.config.decoder_start_token_id
-         >>> last_hidden_state = model(input_features, decoder_input_ids=decoder_input_ids).last_hidden_state
-         >>> list(last_hidden_state.shape)
-         [1, 2, 512]
+
+         >>> generated_ids = model.generate(inputs=input_features)
+
+         >>> transcription = feature_extractor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+         >>> transcription
+         ' Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.'
          ```"""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1674,7 +1677,10 @@ class WhisperForConditionalGeneration(WhisperGenerationMixin, WhisperPreTrainedM
         super().__init__(config)
         self.model = WhisperModel(config)
         self.proj_out = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.ctc_proj = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
         self.max_target_positions = config.max_target_positions
+        self.alpha = 0.3
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1789,8 +1795,19 @@ class WhisperForConditionalGeneration(WhisperGenerationMixin, WhisperPreTrainedM
             loss_fct = CrossEntropyLoss()
             # move labels to correct device to enable PP
             labels = labels.to(lm_logits.device)
-            loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1))
-
+            ce_loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1))
+            
+            # encoder logits, (1500, B, 51866)
+            ctc_outputs = F.log_softmax(self.ctc_proj(outputs.encoder_last_hidden_state), dim=-1).transpose(0, 1).contiguous()
+            
+            # Calculate input_lengths and target_lengthse
+            input_lengths = torch.full((ctc_outputs.size(1),), ctc_outputs.size(0), dtype=torch.long, device=ctc_outputs.device)            
+            target_lengths = torch.sum(labels != -100, dim=1).to(device=ctc_outputs.device)
+            
+            # <|30.00|> 을 blank token으로 사용
+            ctc_loss = F.ctc_loss(ctc_outputs, labels, input_lengths, target_lengths, 51865, "mean", True)
+            loss = (1 - self.alpha) * ce_loss + self.alpha * ctc_loss
+                        
         if not return_dict:
             output = (lm_logits,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
@@ -1971,7 +1988,9 @@ class WhisperForCausalLM(WhisperPreTrainedModel, GenerationMixin):
             input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
                 Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
                 provide it. Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-                [`PreTrainedTokenizer.__call__`] for details. [What are input IDs?](../glossary#input-ids)
+                [`PreTrainedTokenizer.__call__`] for details.
+
+                [What are input IDs?](../glossary#input-ids)
             attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
                 Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
                 - 1 for tokens that are **not masked**,
@@ -1990,8 +2009,8 @@ class WhisperForCausalLM(WhisperPreTrainedModel, GenerationMixin):
                 - 0 indicates the head is **masked**.
             past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
                 Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of
-                shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of
-                shape `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`. The two additional
+                shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of shape
+                `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`. The two additional
                 tensors are only required when the model is used as a decoder in a Sequence to Sequence model. Contains
                 pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
                 blocks) that can be used (see `past_key_values` input) to speed up sequential decoding. If
@@ -1999,9 +2018,9 @@ class WhisperForCausalLM(WhisperPreTrainedModel, GenerationMixin):
                 don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
                 `decoder_input_ids` of shape `(batch_size, sequence_length)`.
             inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-                Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation.
-                This is useful if you want more control over how to convert `input_ids` indices into associated vectors
-                than the model's internal embedding lookup matrix.
+                Optionally, instead of passing `input_ids` you can choose to directly pass an embedded
+                representation. This is useful if you want more control over how to convert `input_ids` indices into
+                associated vectors than the model's internal embedding lookup matrix.
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
                 Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
